@@ -162,7 +162,7 @@ message StreamOutputRequest {
   string job_id = 1;
 }
 message StreamOutputResponse {
-  string job_uid = 1;
+  string job_id = 1;
   bytes payload = 2; // I’m concerned that the payload might be large
   string message = 3;
 }
@@ -170,7 +170,7 @@ message StreamOutputResponse {
 message ListJobsRequest {}
 message ListJobsResponse {
   repeated JobInfo jobs = 1;
-  string messages = 2;
+  string message = 2;
 }
 message JobInfo {
   string job_id = 1;
