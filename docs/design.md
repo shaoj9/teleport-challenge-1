@@ -164,9 +164,9 @@ message StreamOutputResponse {
 }
 
  ```
-As shown in the architecture, the gRPC server is configured with ca.crt, server.key, and server.crt to enable mTLS and verify client certificates. This is implemented using an authentication interceptor placed before the job service, in order to satisfy the requirement: ‘Use mTLS authentication and verify client certificates. Set up a strong set of cipher suites for TLS and a secure cryptographic configuration for certificates. Do not use any other authentication protocols on top of mTLS.
+As shown in the architecture, the gRPC server is configured with ca.crt, server.key, and server.crt to enable mTLS and verify client certificates. This is implemented using an authentication interceptor placed before the job service, in order to satisfy the requirement "Use mTLS authentication and verify client certificates. Set up a strong set of cipher suites for TLS and a secure cryptographic configuration for certificates. Do not use any other authentication protocols on top of mTLS."
 
-An authorization interceptor that checks the Organizational Unit (OU) field as the role and uses a simple authorization scheme (user and admin), in accordance with the requirement ‘Use a simple authorization scheme.
+An authorization interceptor that checks the Organizational Unit (OU) field as the role and uses a simple authorization scheme (user and admin), in accordance with the requirement to use a simple authorization scheme.
 
 ## Library
 ### Resource Control
