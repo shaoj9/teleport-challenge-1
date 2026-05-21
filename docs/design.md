@@ -5,12 +5,12 @@ It is a prototype job worker service designed based on the requirements at https
 ### Definition
 The service provides an API for running arbitrary Linux processes. These processes can be any executable programs available on the machine hosting the service. The API supports specifying commands, arguments, and environment variables.
 
-To support job status queries, each job is assigned a unique ID (UID). Resource controls for CPU, memory, and disk I/O are implemented per job using cgroups v2, as requested.
+To support job status queries, each job is assigned a unique ID (JobID). Resource controls for CPU, memory, and disk I/O are implemented per job using cgroups v2, as requested.
 
 There are also some implicit requirements, such as maintaining job status information for querying and supporting role-based access control for authorization (using CN for user and OU for role as a simple approach). Request timeouts are hardcoded on the gRPC server side.
 ```golang
 type JobSpec struct {
-    UID       string
+    JobID     string
     Command   string
     Args      []string
     Resources map[string]string
@@ -124,6 +124,7 @@ enum JobStatus {
   JOB_STATUS_STOPPED = 2;
   JOB_STATUS_FAILED = 3;
   JOB_STATUS_COMPLETED = 4;
+  JOB_STATUS_TIMEOUT = 5;
 }
 
 message StartJobRequest {
@@ -188,15 +189,15 @@ As shown in the architecture, an authentication interceptor and an authorization
 
 ## Library
 ### Resource Control
-It is implemented using cgroups v2. When a job starts, its resource limits are applied by creating a cgroup named after its jobUID. A command is constructed from the job’s command and argument attributes. After the command is created, the process ID (PID) and any child process IDs are added to cgroup.procs (use SIGSTOP and resume with SIGCONT to get child processes for race condition concerns).
+It is implemented using cgroups v2. When a job starts, its resource limits are applied by creating a cgroup named after its job id. A command is constructed from the job’s command and argument attributes. After the command is started, the process ID (PID) and any child process IDs are added to cgroup.procs (use SIGSTOP and resume with SIGCONT to get child processes for race condition concerns).
 
 When a stop job request is received, all processes in cgroup.procs are killed, and the corresponding cgroup files are removed.
 
 ### Metadata
-A job store is created with an in-memory map where the key is the jobUID and the value is the job’s metadata. This is used for querying job status. In addition, each job record is persisted to disk as a JSON file for crash recovery or testing, which might be optional.
+A job store is created with an in-memory map where the key is the job id and the value is the job’s metadata. This is used for querying job status. In addition, each job record is persisted to disk as a JSON file for crash recovery or testing, which might be optional.
  ```
 type JobRecord struct {
-	JobID     string    `json:"job_id"`
+	JobID      string    `json:"job_id"`
 	Command    string    `json:"command"`
 	Args       []string  `json:"args"`
     Resources  []string  `json:"resources"`
