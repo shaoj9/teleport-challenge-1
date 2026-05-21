@@ -215,34 +215,74 @@ type JobStore struct {
 }
  ```
 ### Output
+For streaming output, there might be one writer and multiple readers for a running job.  To efficiently notify multiple readers when new data is written without busy-waiting or polling, use a sync.Cond (Condition Variable) combined with a sync.RWMutex.This approach allows readers to safely suspend execution and sleep until the writer explicitly signals that new data is available, maximizing CPU efficiency.
 
-A thread-safe OutputBuffer is created to support writing and streaming output, balancing memory usage and performance.
- ```
-type OutputBuffer struct {
-	file   *os.File
-	writer *bufio.Writer
-	reader *bufio.Reader
-	mu     sync.Mutex
+When a job is completed, timeout, failed, or stopped, a done flag is to indicate that no more data will arrive so readers can exit cleanly.
+```
+type SharedFile struct {
+	mu      sync.Mutex
+	cond    *sync.Cond
+	version uint64
+	done    bool
 }
  ```
+
+A writer 
+```
+sharedFile.mu.Lock()
+defer sf.mu.Unlock()
+...
+...
+...
+
+sharedFile.version++        // Update state
+sharedFile.cond.Broadcast() // Wake up all waiting readers efficiently
+```
+
+Readers
+```
+sharedFile.mu.RLock()
+defer sf.mu.RUnlock()
+...
+...
+...
+
+for sharedFile.version == last && !sharedFile.done{
+	sharedFile.cond.Wait()
+}
+
+```
+
 
 ## Testing
 ### Job Lifecycle
 Start a job → get job status → stop the job → stream its output -> list all the jobs
+
 Start a job → stop the job → get job status → stream its output -> list all the jobs
+
 Start a job → stream its output until completion -> list all the jobs
+
 Start multiple jobs → stream their outputs -> list all the jobs
+
 Start multiple jobs → stop a job randomly → get job status → stream their outputs -> list all the jobs
+
 Start multiple jobs → stream their outputs → stop a job randomly -> list all the jobs
 ### Authenication
 Access gRPC server without certificates
+
 Access gRPC server with invalid certificates
+
 Access gRPC server with valid certificates
 ### Authorization
 Access own jobs
+
 Access other jobs using user role
+
 Access other jobs using admin role
+
 ### Resource controls
 Start a job when insufficient resources are available
+
 Pass valid resource limits → check if new jobs are running
+
 Run jobs → check for resource leaks 
