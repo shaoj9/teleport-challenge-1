@@ -256,17 +256,30 @@ for sharedFile.version == last && !sharedFile.done{
 
 ## Testing
 ### Job Lifecycle
-Start a job → get job status → stop the job → stream its output -> list all the jobs
+Start a job → get job status → stop the job → stream its output → list all the jobs
 
-Start a job → stop the job → get job status → stream its output -> list all the jobs
+Start a job → stop the job → get job status → stream its output → list all the jobs
 
-Start a job → stream its output until completion -> list all the jobs
+Start a job → stop the job → get job status → stop the job again → list all the jobs
 
-Start multiple jobs → stream their outputs -> list all the jobs
+Start a job → stream its output until completion → list all the jobs
 
-Start multiple jobs → stop a job randomly → get job status → stream their outputs -> list all the jobs
+Start a long-run job to hit timeout limit → stream its output → get job status → list all the jobs
 
-Start multiple jobs → stream their outputs → stop a job randomly -> list all the jobs
+Start a job with errors → stream its output → get job status → list all the jobs
+
+Start multiple jobs → stream their outputs → list all the jobs
+
+Start multiple jobs → stop jobs randomly → get job status → stream their outputs → list all the jobs
+
+Start multiple jobs → stream their outputs → stop jobs randomly → list all the jobs
+
+Start different type jobs(normal, timeout, error) jobs → stop jobs randomly → get job status → stream their outputs → list all the jobs
+
+Start jobs → use mutiple clients to stream their outputs when the job are running
+
+Start jobs → use mutiple clients to stream their outputs after the job are completed
+
 ### Authenication
 Access gRPC server without certificates
 
@@ -281,7 +294,10 @@ Access other jobs using user role
 Access other jobs using admin role
 
 ### Resource controls
-Start a job when insufficient resources are available
+
+Pass large resource limits that the current system fails to meet → check if new jobs are running
+
+Pass invalid resource limits → check if new jobs are running
 
 Pass valid resource limits → check if new jobs are running
 
