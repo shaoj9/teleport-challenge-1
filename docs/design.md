@@ -215,9 +215,9 @@ type JobStore struct {
 }
  ```
 ### Output
-For streaming output, there might be one writer and multiple readers for a running job.  To efficiently notify multiple readers when new data is written without busy-waiting or polling, use a sync.Cond (Condition Variable) combined with a sync.RWMutex.This approach allows readers to safely suspend execution and sleep until the writer explicitly signals that new data is available, maximizing CPU efficiency.
+For streaming output, a running job may have one writer and multiple readers. To efficiently notify multiple readers when new data is written without busy-waiting or polling, use a sync.Cond (Condition Variable) combined with a sync.RWMutex.This approach allows readers to safely suspend execution and sleep until the writer explicitly signals that new data is available, maximizing CPU efficiency.
 
-When a job is completed, timeout, failed, or stopped, a done flag is to indicate that no more data will arrive so readers can exit cleanly.
+When a job completes, times out, fails, or is stopped, a done flag is used to indicate that no more data will arrive, allowing readers to exit cleanly.
 ```
 type SharedFile struct {
 	mu      sync.Mutex
@@ -227,10 +227,10 @@ type SharedFile struct {
 }
  ```
 
-A writer 
+Writer 
 ```
 sharedFile.mu.Lock()
-defer sf.mu.Unlock()
+defer sharedFile.mu.Unlock()
 ...
 ...
 ...
@@ -239,10 +239,10 @@ sharedFile.version++        // Update state
 sharedFile.cond.Broadcast() // Wake up all waiting readers efficiently
 ```
 
-Readers
+Reader
 ```
 sharedFile.mu.RLock()
-defer sf.mu.RUnlock()
+defer sharedFile.mu.RUnlock()
 ...
 ...
 ...
