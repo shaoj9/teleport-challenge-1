@@ -3,7 +3,7 @@
 It is a prototype job worker service designed based on the requirements at https://github.com/gravitational/careers/blob/main/challenges/systems/challenge-1.md. 
 ## Job
 ### Definition
-The service provides an API for running arbitrary Linux processes. These processes can be any executable programs available on the machine hosting the service. The API supports specifying commands, arguments, and environment variables.
+The service provides an API for running arbitrary Linux processes. These processes can be any executable programs available on the machine hosting the service. The API supports specifying command, arguments, and resource controls(cpu, memory, ioread, iowrite).
 
 To support job status queries, each job is assigned a unique ID (JobID) using a UUID to prevent exposing process IDs for security concerns. Resource controls for CPU, memory, and disk I/O are implemented per job using cgroups v2, as requested.
 
@@ -12,7 +12,10 @@ type JobSpec struct {
     JobID     string
     Command   string
     Args      []string
-    Resources map[string]string
+    CPU       int
+    Memory    int
+    IORead    int
+    IOWrite   int
     ProcessID int
     Status    JobStatus
     Username  string
@@ -37,7 +40,7 @@ Since we use mTLS authentication, client certificates are presented to the serve
 
 The certificates contain the CN (Common Name) field as the username and the OU (Organizational Unit) field as the role for authorization purposes. The server validates these fields against an access control list (ACL), which supports two roles: user and admin. The user role can create jobs and can stop jobs, get job status, and stream job output, but only for jobs they created. They do not have access to jobs created by others. Admin users have access to stop, get status, and stream output for all jobs
 
-We also added resource control as described above. Resource flags are provided as key-value pairs, for example: --resource cpu=1 --resource memory=30m. The current implementation supports cpu (number of CPU cores), memory (memory.max as the memory limit), io.read (disk read throughput limit), and io.write (disk write throughput limit).
+We also added resource control as described above. Resource flags are provided as key-value pairs, for example: --resource cpu=1 --resource memory=30m. The current implementation supports cpu (number of CPU cores), memory (memory.max as the memory limit), ioread (disk read throughput limit), and iowrite (disk write throughput limit).
 
 
 ### Start Job
@@ -49,7 +52,10 @@ client start \
   --ca ca.crt \
   --command /usr/bin/python  \
   --arg -m --arg 8080 \
-  --resource cpu=1 --resource memory=30m --resource io.read=10mb --resource io.write=5mb
+  --cpu=1 
+  --memory=30000000
+  --ioread=10000000
+  --iowrite=5000000
  ```
 ### Stop Job
  ```
@@ -136,10 +142,8 @@ message StopJobRequest {
   string job_id = 1;
 }
 message StopJobResponse {
-  // ID of the job that was requested to stop.
-  string job_id = 1;
   // Indicates whether the job was successfully stopped.
-  bool stopped = 2;
+  bool stopped = 1;
 }
 
 message GetStatusRequest {
@@ -147,10 +151,8 @@ message GetStatusRequest {
   string job_id = 1;
 }
 message GetStatusResponse {
-  // ID of the job being queried.
-  string job_id = 1;
   // Current state of the job.
-  JobStatus status = 2;
+  JobStatus status = 1;
 }
 
 message StreamOutputRequest {
@@ -158,11 +160,9 @@ message StreamOutputRequest {
   string job_id = 1;
 }
 message StreamOutputResponse {
-  // ID of the job whose output stream is requested.
-  string job_id = 1;
   // Chunk of raw output data from the job.
   // Typically represents stdout and stderr stream bytes.
-  bytes payload = 2 
+  bytes payload = 1; 
 }
 
  ```
@@ -199,13 +199,50 @@ if len(cert.DNSNames) == 0 && len(cert.IPAddresses) == 0 {
 	return fmt.Errorf("security violation: certificate is missing Subject Alternative Names (SANs)")
 }
 ```
-An authorization interceptor that checks the Organizational Unit (OU) field as the role and uses a simple authorization scheme (user and admin), in accordance with the requirement to use a simple authorization scheme.
+An authz that checks the Organizational Unit (OU) field as the role and uses a simple authorization scheme (user and admin), in accordance with the requirement to use a simple authorization scheme.
 
 ## Library
 ### Resource Control
-It is implemented using cgroups v2. When a job starts, its resource limits are applied by creating a cgroup named after its job id. A command is constructed from the job’s command and argument attributes. After the command is started, the process ID (PID) and any child process IDs are added to cgroup.procs (use SIGSTOP and resume with SIGCONT to get child processes for race condition concerns).
+It is implemented using cgroups v2. When a job starts, its resource limits are applied by creating and configuring a cgroup named after its job ID before process execution. A command is constructed from the job’s command and arguments, and the process is started normally. After the process is spawned, its PID (and any child processes, indirectly via process group management) is added to cgroup.procs.
 
-When a stop job request is received, the worker should terminate all processes within the job’s cgroup (as listed in cgroup.procs) by sending appropriate termination signals. After all processes have exited and the cgroup is empty, the corresponding cgroup directory can be removed. This ensures that all child processes belonging to the job are also terminated, satisfying the requirement that stopping a job must clean up its entire process tree.
+However, there may still be a very small time window between process creation and cgroup assignment during which resource usage is not yet fully constrained.
+
+```
+    pid := cmd.Process.Pid
+    // 1. Pause the process immediately so it can't consume anything yet
+    _ = cmd.Process.Signal(syscall.SIGSTOP)
+    // 2. Attach the process to  job cgroup
+    procsFile := filepath.Join(cgroupPath, "cgroup.procs")
+	if err := os.WriteFile(procsFile, []byte(strconv.Itoa(pid)), 0644); err != nil {
+		fmt.Printf("[-] Failed to move PID to cgroup.procs: %v\n", err)
+		return
+	}
+    // 3. Safely resume the process under the new strict boundaries
+    _ = cmd.Process.Signal(syscall.SIGCONT)
+```
+An alternative is to use systemd to run the command, allowing systemd to create and manage the underlying cgroup automatically using its unit and slice configuration, like "/sys/fs/cgroup/jobs/jobs_id"
+```
+systemd-run --scope --slice=jobs --unit=job_id -p CPUQuota=20% -p MemoryMax=500M command
+```
+
+When a stop job request is received, the worker should terminate all processes within the job’s cgroup (as listed in cgroup.procs) by triggering a kill using the following codes. After all processes have exited and the cgroup is empty, the corresponding cgroup directory can be removed. This ensures that all child processes belonging to the job are also terminated, satisfying the requirement that stopping a job must clean up its entire process tree. It can be applied to systemd-run jobs as well.
+```
+    killFilePath := filepath.Join(cgroupPath, "cgroup.kill")
+
+	// Open the file with write-only permissions.
+	// O_WRONLY is required because cgroup.kill is a write-only interface.
+	file, err := os.OpenFile(killFilePath, os.O_WRONLY, 0)
+	if err != nil {
+		return fmt.Errorf("failed to open cgroup.kill: %w", err)
+	}
+	defer file.Close()
+
+	// Write "1" to trigger the kernel-level SIGKILL cascade.
+	_, err = file.WriteString("1")
+	if err != nil {
+		return fmt.Errorf("failed to write to cgroup.kill: %w", err)
+	}
+```
 
 ### Metadata
 A job store is created with an in-memory map where the key is the job id and the value is the job’s metadata. This is used for querying job status to satisify the requirement "Worker library with methods to query status of a job". In addition, each job record is persisted to disk as a JSON file for crash recovery or testing, which might be optional.
@@ -237,7 +274,7 @@ Output is persisted on disk, especially for completed jobs, so that readers can 
 When a job completes, times out, fails, or is stopped, a done flag is used to indicate that no more data will arrive, allowing readers to exit cleanly.
 ```
 type SharedFile struct {
-	mu      sync.Mutex
+	mu      sync.RWMutex
 	cond    *sync.Cond
 	version uint64
 	done    bool
