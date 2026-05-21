@@ -35,7 +35,7 @@ Cobra is integrated to create a root command that supports four subcommands: sta
 
 Since we use mTLS authentication, client certificates are presented to the server during the TLS handshake for verification. These certificates are used to authenticate the client and authorize requests.
 
-The certificates contain the CN (Common Name) field as the username and the OU (Organizational Unit) field as the role for authorization purposes. The server validates these fields against an access control list (ACL), which supports two roles: user and admin. The user role can create jobs and can stop jobs, get job status, and stream job output, but only for jobs they created. They do not have access to jobs created by others. Admin users have access to stop , get status, and stream output for all jobs
+The certificates contain the CN (Common Name) field as the username and the OU (Organizational Unit) field as the role for authorization purposes. The server validates these fields against an access control list (ACL), which supports two roles: user and admin. The user role can create jobs and can stop jobs, get job status, and stream job output, but only for jobs they created. They do not have access to jobs created by others. Admin users have access to stop, get status, and stream output for all jobs
 
 We also added resource control as described above. Resource flags are provided as key-value pairs, for example: --resource cpu=1 --resource memory=30m. The current implementation supports cpu (number of CPU cores), memory (memory.max as the memory limit), io.read (disk read throughput limit), and io.write (disk write throughput limit).
 
@@ -71,7 +71,7 @@ client status \
   --id  cb056f6e-1643-44d3-9f64-11688bc562c4
  ```
 
-  ### Stream output
+ ### Stream output
  ```
 client output \
   --server [ip:port] \
@@ -158,14 +158,47 @@ message StreamOutputRequest {
   string job_id = 1;
 }
 message StreamOutputResponse {
+  // ID of the job whose output stream is requested.
+  string job_id = 1;
   // Chunk of raw output data from the job.
   // Typically represents stdout and stderr stream bytes.
-  bytes payload = 1; 
+  bytes payload = 2 
 }
 
  ```
-As shown in the architecture, the gRPC server is configured with ca.crt, server.key, and server.crt to enable mTLS and verify client certificates. This is implemented using an authentication interceptor placed before the job service, in order to satisfy the requirement "Use mTLS authentication and verify client certificates. Set up a strong set of cipher suites for TLS and a secure cryptographic configuration for certificates. Do not use any other authentication protocols on top of mTLS."
+As shown in the architecture, the gRPC server is configured with ca.crt, server.key, and server.crt to enable mTLS and verify client certificates against a trusted Certificated Authority. This is implemented using an authentication interceptor placed before the job service, in order to satisfy the requirement "Use mTLS authentication and verify client certificates.".
 
+The authentication interceptor also checks whether the active cipher belongs to a strong set of TLS cipher suites.
+```
+var AllowedCipherSuites = map[uint16]bool{
+	tls.TLS_AES_256_GCM_SHA384:                  true, // TLS 1.3
+	tls.TLS_CHACHA20_POLY1305_SHA256:            true, // TLS 1.3
+	tls.TLS_AES_128_GCM_SHA256:                  true, // TLS 1.3
+	tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384: true, // TLS 1.2 (Strict Forward Secrecy)
+}
+...
+...
+...
+// Extract the active cipher suite ID determined during the handshake
+activeCipher := tlsInfo.State.CipherSuite
+// Reject if the cipher is not explicitly present in our allowed map
+if !AllowedCipherSuites[activeCipher] {
+    cipherName := tls.CipherSuiteName(activeCipher)
+    return status.Errorf(
+        codes.Unauthenticated,
+        "cryptographic violation: cipher suite %s (0x%X) fails security baseline",
+        cipherName,
+        activeCipher,
+    )
+}
+```
+We might also validate that certificates follow proper cryptographic practices, such as having Subject Alternative Names (SANs).
+```
+//Enforce Presence of SANs
+if len(cert.DNSNames) == 0 && len(cert.IPAddresses) == 0 {
+	return fmt.Errorf("security violation: certificate is missing Subject Alternative Names (SANs)")
+}
+```
 An authorization interceptor that checks the Organizational Unit (OU) field as the role and uses a simple authorization scheme (user and admin), in accordance with the requirement to use a simple authorization scheme.
 
 ## Library
@@ -183,6 +216,7 @@ type JobRecord struct {
 	Args       []string  `json:"args"`
     Resources  []string  `json:"resources"`
 	Status     string    `json:"status"`
+    UserName   string    `json:"user_name"`
 	PID        int       `json:"pid"`
 	ExitCode   int       `json:"exit_code"`
 	StartTime  time.Time `json:"start_time"`
@@ -196,7 +230,7 @@ type JobStore struct {
 }
  ```
 ### Output
-For streaming output, a running job may have one writer and multiple readers. To efficiently notify multiple readers when new data is written without busy-waiting or polling, use a sync.Cond (Condition Variable) combined with a sync.RWMutex.This approach allows readers to safely suspend execution and sleep until the writer explicitly signals that new data is available, maximizing CPU efficiency to satisfy the requirement "Discovering new output should be efficient, avoid busy-waiting or polling". The sync.RWMutex is also introduced to support multiple concurrent clients. Readers and writers operate on raw byte slices, without embedding assumptions about the process's output - it may be text or raw binary data.
+For streaming output, a running job may have one writer and multiple readers. To efficiently notify multiple readers when new data is written without busy-waiting or polling, use a sync.Cond (Condition Variable) combined with a sync.RWMutex.This approach allows readers to safely suspend execution and sleep until the writer explicitly signals that new data is available, maximizing CPU efficiency to satisfy the requirement "Discovering new output should be efficient, avoid busy-waiting or polling". The sync.RWMutex is also introduced to support multiple concurrent clients. 
 
 Output is persisted on disk, especially for completed jobs, so that readers can start from beginning as "Output should be from start of process execution." required.
 
@@ -235,8 +269,13 @@ for sharedFile.version == last && !sharedFile.done{
 }
 
 ```
-
-
+Readers and writers operate on raw bytes, without embedding assumptions about the process's output - it may be text or raw binary data.
+```
+r := bufio.NewReader(outputfile)
+buf := make([]byte, 32*1024) 
+...
+n, err := r.Read(buf)
+```
 ## Testing
 ### Job Lifecycle
 Start a job → get job status → stop the job → stream its output → list all the jobs
