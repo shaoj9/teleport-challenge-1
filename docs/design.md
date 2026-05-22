@@ -203,14 +203,13 @@ An authz that checks the Organizational Unit (OU) field as the role and uses a s
 
 ## Library
 ### Resource Control
-
-SysProcAttr.Ptrace is set true so that the command process does not execute any instructions to consume resources before the pid is written to the cgroup v2 for resource control.
+The gRPC server is the parent process, and the job commands are child processes spawned by the gRPC server. Therefore, SysProcAttr.Ptrace is set to true so the child process stops after fork and before exec, allowing the parent to place the process into the cgroup v2 before it executes any instructions to consume significant resources.
 ```
     cmd.SysProcAttr = &syscall.SysProcAttr{
 		Ptrace: true,
 	}
 ```
-Because Ptrace: true was requested, the kernel immediately sends a SIGTRAP signal to the command  process before it executes any instructions. After the pid is written to cgroup, the pid is released to run safely.
+Because Ptrace: true was requested, the child process is stopped by the kernel before it executes the target program. After the PID is added to the cgroup, the parent resumes the process by calling PtraceDetach on the child process.
 ```
 	if err := os.WriteFile(procsFile, []byte(strconv.Itoa(pid)), 0644); err != nil {
 		fmt.Printf("Failed to move PID to cgroup.procs: %v\n", err)
@@ -223,7 +222,6 @@ Because Ptrace: true was requested, the kernel immediately sends a SIGTRAP signa
 		return
 	}
 ```
-
 When a stop job request is received, the worker should terminate all processes within the job’s cgroup (as listed in cgroup.procs) by triggering a kill using the following codes. After all processes have exited and the cgroup is empty, the corresponding cgroup directory can be removed. This ensures that all child processes belonging to the job are also terminated, satisfying the requirement that stopping a job must clean up its entire process tree.
 ```
     killFilePath := filepath.Join(cgroupPath, "cgroup.kill")
@@ -335,10 +333,10 @@ t reaches the end of the file and exits once the file is fully finised. Otherwis
 
         if finished {
             return nil
-        }
+        }       
 
         select {
-        case <-ctx.Done():
+
             return ctx.Err()
 
         case <-notify:
