@@ -209,7 +209,7 @@ The gRPC server is the parent process, and the job commands are child processes 
 		Ptrace: true,
 	}
 ```
-Because Ptrace: true was requested, the child process is stopped by the kernel before it executes the target program. After the PID is added to the cgroup, the parent resumes the process by calling PtraceDetach on the child process.
+Because Ptrace: true was requested, the child process is stopped by the kernel before it executes any instructions. After the PID is added to the cgroup, the parent resumes the process by calling PtraceDetach on the child process.
 ```
 	if err := os.WriteFile(procsFile, []byte(strconv.Itoa(pid)), 0644); err != nil {
 		fmt.Printf("Failed to move PID to cgroup.procs: %v\n", err)
@@ -314,8 +314,8 @@ func (f *OutputFileStream) notifyAll() {
 ```
 The read flow is to subscribe first and open its own file descriptor at the start of a job. It reads the file in blocks and streams each block accordingly.
 ```
-    notify := f.Subscribe()
-    defer f.Unsubscribe(notify)
+    sub := f.Subscribe()
+    defer f.Unsubscribe(sub)
     file, err := os.Open(f.outputFilePath)
     ...
     offset := int64(0)
@@ -324,26 +324,23 @@ The read flow is to subscribe first and open its own file descriptor at the star
     for {
         n, err := file.ReadAt(buf, offset)
 ```
-t reaches the end of the file and exits once the file is fully finised. Otherwise, it waits for the writer to notify it.
+It reaches the end of the file and exits once the file is fully finised. Otherwise, it waits for the writer to notify it.
 ```
-    if err == io.EOF {
-        f.mu.Lock()
-        finished := f.finished
-        f.mu.Unlock()
+        // Check whether writer is finshed
+		f.mu.Lock()
+		finished := f.finished
+		f.mu.Unlock()
 
-        if finished {
-            return nil
-        }       
-
-        select {
-
-            return ctx.Err()
-
-        case <-notify:
+		if finished {
+			return nil, nil
+		}
+        // Efficient wait
+		select {
+            case <-ctx.Done():
+                return nil, ctx.Err()
+            case <-sub:
         }
 
-        continue
-    }
 ```
 ## Testing
 ### Job Lifecycle
