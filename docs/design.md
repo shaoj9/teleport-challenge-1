@@ -264,7 +264,7 @@ type JobStore struct {
 }
 ```
 ### Output
-OutputFileStream is created for each job output file.
+An OutputFileStream is created for each job output file.
 ```
 type OutputFileStream struct {
     outputFilePath string
@@ -276,7 +276,7 @@ type OutputFileStream struct {
     subs map[chan struct{}]struct{}
 }
 ```
-The write flow is to append to the job output file when the job is running.
+The write flow appends to the job output file while the job is running and the new appends to the job output file are broadcast to all subscribed readers.
 ```
 func (f *OutputFileStream) Append(data []byte) error {
     file, err := os.OpenFile(f.outputFilePath, os.O_APPEND|os.O_WRONLY, 0644)
@@ -288,18 +288,10 @@ func (f *OutputFileStream) Append(data []byte) error {
     f.mu.Unlock()
 
     f.notifyAll() // Broadcast notifications
-```
-To make it completed
-```
-func (f *OutputFileStream) Finish() {
-    f.mu.Lock()
-    f.finished = true
-    f.mu.Unlock()
-    f.notifyAll() // Broadcast notifications
+    ...
+    ...
+    ...
 }
-```
-To boardcast the updates to all the subscribed readers
-```
 func (f *OutputFileStream) notifyAll() {
     f.mu.Lock()
     defer f.mu.Unlock()
@@ -312,7 +304,16 @@ func (f *OutputFileStream) notifyAll() {
     }
 }
 ```
-The read flow is to subscribe first and open its own file descriptor at the start of a job. It reads the file in blocks and streams each block accordingly.
+Once the job completes, stops, or fails, we set the OutputFileStream finished flag to true.
+```
+func (f *OutputFileStream) Finish() {
+    f.mu.Lock()
+    f.finished = true
+    f.mu.Unlock()
+    f.notifyAll() // Broadcast notifications
+}
+```
+The read flow subscribes first, opens a file descriptor, then reads the file in blocks and streams each block.
 ```
     sub := f.Subscribe()
     defer f.Unsubscribe(sub)
@@ -324,7 +325,7 @@ The read flow is to subscribe first and open its own file descriptor at the star
     for {
         n, err := file.ReadAt(buf, offset)
 ```
-It reaches the end of the file and exits once the file is fully finised. Otherwise, it waits for the writer to notify it.
+It reaches the end of the file and exits once the file is fully finished. Otherwise, it waits for the writer to notify it.
 ```
         // Check whether writer is finshed
 		f.mu.Lock()
