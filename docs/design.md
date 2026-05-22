@@ -203,29 +203,28 @@ An authz that checks the Organizational Unit (OU) field as the role and uses a s
 
 ## Library
 ### Resource Control
-It is implemented using cgroups v2. When a job starts, its resource limits are applied by creating and configuring a cgroup named after its job ID before process execution. A command is constructed from the job’s command and arguments, and the process is started normally. After the process is spawned, its PID (and any child processes, indirectly via process group management) is added to cgroup.procs.
 
-However, there may still be a very small time window between process creation and cgroup assignment during which resource usage is not yet fully constrained.
-
+SysProcAttr.Ptrace is set true so that the command process does not execute any instructions to consume resources before the pid is written to the cgroup v2 for resource control.
 ```
-    pid := cmd.Process.Pid
-    // 1. Pause the process immediately so it can't consume anything yet
-    _ = cmd.Process.Signal(syscall.SIGSTOP)
-    // 2. Attach the process to  job cgroup
-    procsFile := filepath.Join(cgroupPath, "cgroup.procs")
+    cmd.SysProcAttr = &syscall.SysProcAttr{
+		Ptrace: true,
+	}
+```
+Because Ptrace: true was requested, the kernel immediately sends a SIGTRAP signal to the command  process before it executes any instructions. After the pid is written to cgroup, the pid is released to run safely.
+```
 	if err := os.WriteFile(procsFile, []byte(strconv.Itoa(pid)), 0644); err != nil {
-		fmt.Printf("[-] Failed to move PID to cgroup.procs: %v\n", err)
+		fmt.Printf("Failed to move PID to cgroup.procs: %v\n", err)
 		return
 	}
-    // 3. Safely resume the process under the new strict boundaries
-    _ = cmd.Process.Signal(syscall.SIGCONT)
-```
-An alternative is to use systemd to run the command, allowing systemd to create and manage the underlying cgroup automatically using its unit and slice configuration, like "/sys/fs/cgroup/jobs/jobs_id"
-```
-systemd-run --scope --slice=jobs --unit=job_id -p CPUQuota=20% -p MemoryMax=500M command
+    fmt.Println("Process successfully assigned to cgroup.")
+
+	if err := syscall.PtraceDetach(pid); err != nil {
+		fmt.Printf("Failed to detach ptrace: %v\n", err)
+		return
+	}
 ```
 
-When a stop job request is received, the worker should terminate all processes within the job’s cgroup (as listed in cgroup.procs) by triggering a kill using the following codes. After all processes have exited and the cgroup is empty, the corresponding cgroup directory can be removed. This ensures that all child processes belonging to the job are also terminated, satisfying the requirement that stopping a job must clean up its entire process tree. It can be applied to systemd-run jobs as well.
+When a stop job request is received, the worker should terminate all processes within the job’s cgroup (as listed in cgroup.procs) by triggering a kill using the following codes. After all processes have exited and the cgroup is empty, the corresponding cgroup directory can be removed. This ensures that all child processes belonging to the job are also terminated, satisfying the requirement that stopping a job must clean up its entire process tree.
 ```
     killFilePath := filepath.Join(cgroupPath, "cgroup.kill")
 
@@ -246,7 +245,7 @@ When a stop job request is received, the worker should terminate all processes w
 
 ### Metadata
 A job store is created with an in-memory map where the key is the job id and the value is the job’s metadata. This is used for querying job status to satisify the requirement "Worker library with methods to query status of a job". In addition, each job record is persisted to disk as a JSON file for crash recovery or testing, which might be optional.
- ```
+```
 type JobRecord struct {
 	JobID      string    `json:"job_id"`
 	Command    string    `json:"command"`
@@ -265,53 +264,88 @@ type JobStore struct {
 	mu      sync.RWMutex //For reading and writing the job record map
 	records map[string]*JobRecord
 }
- ```
+```
 ### Output
-For streaming output, a running job may have one writer and multiple readers. To efficiently notify multiple readers when new data is written without busy-waiting or polling, use a sync.Cond (Condition Variable) combined with a sync.RWMutex.This approach allows readers to safely suspend execution and sleep until the writer explicitly signals that new data is available, maximizing CPU efficiency to satisfy the requirement "Discovering new output should be efficient, avoid busy-waiting or polling". The sync.RWMutex is also introduced to support multiple concurrent clients. 
-
-Output is persisted on disk, especially for completed jobs, so that readers can start from beginning as "Output should be from start of process execution." required.
-
-When a job completes, times out, fails, or is stopped, a done flag is used to indicate that no more data will arrive, allowing readers to exit cleanly.
+OutputFileStream is created for each job output file.
 ```
-type SharedFile struct {
-	mu      sync.RWMutex
-	cond    *sync.Cond
-	version uint64
-	done    bool
+type OutputFileStream struct {
+    outputFilePath string
+
+    mu       sync.Mutex
+    size     int64
+    finished bool
+
+    subs map[chan struct{}]struct{}
 }
- ```
-
-Writer 
 ```
-sharedFile.mu.Lock()
-defer sharedFile.mu.Unlock()
-...
-...
-...
-
-sharedFile.version++        // Update state
-sharedFile.cond.Broadcast() // Wake up all waiting readers efficiently
+The write flow is to append to the job output file when the job is running.
 ```
+func (f *OutputFileStream) Append(data []byte) error {
+    file, err := os.OpenFile(f.outputFilePath, os.O_APPEND|os.O_WRONLY, 0644)
+    ...
+    ...
+    ...
+    f.mu.Lock()
+    f.size += int64(n)
+    f.mu.Unlock()
 
-Reader
+    f.notifyAll() // Broadcast notifications
 ```
-sharedFile.mu.RLock()
-defer sharedFile.mu.RUnlock()
-...
-...
-...
-
-for sharedFile.version == last && !sharedFile.done{
-	sharedFile.cond.Wait()
+To make it completed
+```
+func (f *OutputFileStream) Finish() {
+    f.mu.Lock()
+    f.finished = true
+    f.mu.Unlock()
+    f.notifyAll() // Broadcast notifications
 }
+```
+To boardcast the updates to all the subscribed readers
+```
+func (f *OutputFileStream) notifyAll() {
+    f.mu.Lock()
+    defer f.mu.Unlock()
 
+    for ch := range f.subs {
+        select {
+        case ch <- struct{}{}:
+        default:
+        }
+    }
+}
 ```
-Readers and writers operate on raw bytes, without embedding assumptions about the process's output - it may be text or raw binary data.
+The read flow is to subscribe first and open its own file descriptor at the start of a job. It reads the file in blocks and streams each block accordingly.
 ```
-r := bufio.NewReader(outputfile)
-buf := make([]byte, 32*1024) 
-...
-n, err := r.Read(buf)
+    notify := f.Subscribe()
+    defer f.Unsubscribe(notify)
+    file, err := os.Open(f.outputFilePath)
+    ...
+    offset := int64(0)
+    buf := make([]byte, 64*1024) //hardcoded block size
+
+    for {
+        n, err := file.ReadAt(buf, offset)
+```
+t reaches the end of the file and exits once the file is fully finised. Otherwise, it waits for the writer to notify it.
+```
+    if err == io.EOF {
+        f.mu.Lock()
+        finished := f.finished
+        f.mu.Unlock()
+
+        if finished {
+            return nil
+        }
+
+        select {
+        case <-ctx.Done():
+            return ctx.Err()
+
+        case <-notify:
+        }
+
+        continue
+    }
 ```
 ## Testing
 ### Job Lifecycle
